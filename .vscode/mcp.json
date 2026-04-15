@@ -1,17 +1,11 @@
 {
-  "servers": {
-    "playwright": {
-      "command": "npx",
-      "args": ["@playwright/mcp@latest"],
-      "type": "stdio"
-    },
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "type": "stdio",
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_TOKEN}"
-      }
-    }
-  }
+	"inputs": [
+		{
+			"id": "githubToken",
+			"type": "promptString",
+			"description": "GitHub Personal Access Token",
+			"password": true
+		}
+	],
+	"servers": {}
 }

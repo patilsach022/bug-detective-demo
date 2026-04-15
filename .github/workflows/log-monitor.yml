@@ -1,0 +1,212 @@
+name: Log Monitor — Incident Trigger
+
+on:
+  push:
+    paths:
+      - 'output_logs.txt'
+  workflow_dispatch:
+    inputs:
+      force_trigger:
+        description: 'Force create incident trigger issue (bypass threshold check)'
+        required: false
+        default: 'false'
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  analyze-logs:
+    name: Analyze output_logs.txt and trigger incident if needed
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse logs and compute severity
+        id: parse
+        run: |
+          set -euo pipefail
+
+          LOG_FILE="output_logs.txt"
+
+          if [ ! -f "$LOG_FILE" ]; then
+            echo "::notice::$LOG_FILE not found — skipping."
+            echo "should_trigger=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Parse NDJSON: count error lines, collect unique messages/types
+          python3 - "$LOG_FILE" <<'PYEOF'
+          import json, sys, os, collections
+
+          log_file = sys.argv[1]
+          errors = []
+          all_lines = []
+
+          with open(log_file) as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      entry = json.loads(line)
+                      all_lines.append(entry)
+                      if entry.get("level", "").lower() == "error":
+                          errors.append(entry)
+                  except json.JSONDecodeError:
+                      pass  # skip malformed lines
+
+          total_errors = len(errors)
+          unique_messages = list({e.get("message", e.get("msg", "unknown")) for e in errors})
+          unique_types = list({e.get("type", e.get("errorType", "Unknown")) for e in errors})
+
+          # Count per message
+          msg_counts = collections.Counter(
+              e.get("message", e.get("msg", "unknown")) for e in errors
+          )
+
+          # Severity logic
+          # critical: any single error appears 3+ times OR 3+ distinct error types
+          # high:     2 distinct error types
+          # medium:   1 error type / isolated
+          # none:     0 errors
+          any_repeated = any(c >= 3 for c in msg_counts.values())
+          n_types = len(unique_types)
+
+          if total_errors == 0:
+              severity = "none"
+          elif any_repeated or n_types >= 3:
+              severity = "critical"
+          elif n_types == 2:
+              severity = "high"
+          else:
+              severity = "medium"
+
+          # First timestamp
+          first_ts = ""
+          for e in errors:
+              ts = e.get("timestamp", e.get("time", ""))
+              if ts:
+                  first_ts = ts
+                  break
+
+          # Build a markdown summary table
+          rows = []
+          for msg, count in sorted(msg_counts.items(), key=lambda x: -x[1]):
+              matching = [e for e in errors if e.get("message", e.get("msg", "")) == msg]
+              etype = matching[0].get("type", matching[0].get("errorType", "Unknown")) if matching else "Unknown"
+              file_loc = matching[0].get("file", matching[0].get("source", "")) if matching else ""
+              rows.append(f"| `{etype}` | {msg[:80]} | `{file_loc}` | {count} |")
+
+          table = "\n".join(rows)
+
+          # Write to GITHUB_OUTPUT (multiline via env file)
+          output_path = os.environ["GITHUB_OUTPUT"]
+          with open(output_path, "a") as out:
+              out.write(f"total_errors={total_errors}\n")
+              out.write(f"severity={severity}\n")
+              out.write(f"first_timestamp={first_ts}\n")
+              out.write(f"unique_types={','.join(unique_types)}\n")
+              # multiline
+              out.write("summary_table<<EOF\n")
+              out.write("| Type | Message | File | Count |\n")
+              out.write("|------|---------|------|-------|\n")
+              out.write(table + "\n")
+              out.write("EOF\n")
+
+          print(f"total_errors={total_errors}")
+          print(f"severity={severity}")
+          print(f"unique_types={','.join(unique_types)}")
+          PYEOF
+
+      - name: Decide whether to trigger
+        id: decision
+        run: |
+          SEVERITY="${{ steps.parse.outputs.severity }}"
+          FORCE="${{ github.event.inputs.force_trigger }}"
+          TOTAL="${{ steps.parse.outputs.total_errors }}"
+
+          if [ "$FORCE" = "true" ] || [ "$SEVERITY" = "medium" ] || [ "$SEVERITY" = "high" ] || [ "$SEVERITY" = "critical" ]; then
+            echo "should_trigger=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Severity=$SEVERITY, total_errors=$TOTAL — will create incident trigger issue."
+          else
+            echo "should_trigger=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Severity=$SEVERITY, total_errors=$TOTAL — below threshold, no issue created."
+          fi
+
+      - name: Ensure aiops-suggested label exists
+        if: steps.decision.outputs.should_trigger == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create the label if it doesn't already exist (idempotent)
+          gh label create "aiops-suggested" \
+            --description "Created or suggested by an AI/AIOps agent" \
+            --color "0075ca" \
+            --repo "${{ github.repository }}" 2>/dev/null || true
+
+          gh label create "incident-trigger" \
+            --description "Automated incident trigger from log-monitor workflow" \
+            --color "d93f0b" \
+            --repo "${{ github.repository }}" 2>/dev/null || true
+
+          gh label create "ai-generated" \
+            --description "Content generated by an AI agent" \
+            --color "e4e669" \
+            --repo "${{ github.repository }}" 2>/dev/null || true
+
+      - name: Create incident trigger issue
+        if: steps.decision.outputs.should_trigger == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SEVERITY="${{ steps.parse.outputs.severity }}"
+          TOTAL="${{ steps.parse.outputs.total_errors }}"
+          FIRST_TS="${{ steps.parse.outputs.first_timestamp }}"
+          TYPES="${{ steps.parse.outputs.unique_types }}"
+          COMMIT="${{ github.sha }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          BODY=$(cat <<ISSUEBODY
+          ## Incident Trigger — Automated Detection
+
+          **Severity:** \`${SEVERITY^^}\`
+          **Total error lines:** $TOTAL
+          **Error types detected:** $TYPES
+          **First error timestamp:** $FIRST_TS
+          **Triggering commit:** \`${COMMIT:0:8}\`
+          **Workflow run:** $RUN_URL
+
+          ---
+
+          ### Error Summary
+
+          ${{ steps.parse.outputs.summary_table }}
+
+          ---
+
+          ### Next Step
+
+          Invoke the **Bug Detective Orchestrator** agent in GitHub Copilot Chat to begin investigation.
+          The orchestrator will detect this issue automatically when it starts.
+
+          <!-- INCIDENT_TRIGGER
+          {
+            "severity": "$SEVERITY",
+            "total_errors": $TOTAL,
+            "error_types": "$TYPES",
+            "first_timestamp": "$FIRST_TS",
+            "commit": "$COMMIT",
+            "workflow_run": "$RUN_URL"
+          }
+          -->
+          ISSUEBODY
+          )
+
+          gh issue create \
+            --title "[Incident Trigger] $TOTAL errors detected in output_logs.txt (severity: ${SEVERITY^^})" \
+            --body "$BODY" \
+            --label "incident-trigger,ai-generated,aiops-suggested" \
+            --repo "${{ github.repository }}"
