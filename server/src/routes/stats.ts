@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import db from '../db/database.js';
 import logger from '../logger.js';
+import { calculateGrowthRate } from '../helpers/calculations.js';
 import type { RevenueRow, ProductRow, UserStatsRow } from '../types.js';
 
 const router = Router();
@@ -12,8 +13,10 @@ router.get('/revenue', (_req, res) => {
       .prepare('SELECT date, amount FROM revenue_daily ORDER BY date ASC')
       .all() as unknown as RevenueRow[];
 
-    logger.info('Revenue fetched', { service: 'api', route: '/api/stats/revenue' });
-    res.json({ rows });
+    const growth = calculateGrowthRate(rows[rows.length - 1].amount, rows[0].amount);
+
+    logger.info('Revenue fetched', { service: 'api', route: '/api/stats/revenue', growth });
+    res.json({ rows, growth });
   } catch (err: unknown) {
     const e = err as Error;
     logger.error(e.message, {
