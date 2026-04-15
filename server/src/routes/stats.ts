@@ -47,7 +47,7 @@ router.get('/products', (_req, res) => {
 router.get('/users', (_req, res) => {
   try {
     const result = db
-      .prepare('SELECT COUNT(*) as count FROM user_sessions WHERE is_active = 1')
+      .prepare('SELECT COUNT(*) as count FROM user_sessions WHERE active_flag = 1')
       .get() as unknown as UserStatsRow;
 
     logger.info('Users fetched', { service: 'database', route: '/api/stats/users' });
